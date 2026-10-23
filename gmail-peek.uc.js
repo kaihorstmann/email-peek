@@ -29,7 +29,7 @@
   // renders the whole report into a real browser tab — plain HTML, plain
   // links, no chrome APIs required at click time.
   const EPDiag = (window.__EPDiag ||= (() => {
-    const VERSION = "1.9.3";
+    const VERSION = "1.9.4";
     const CONTACT = {
       email: "malachyfernandez@gmail.com",
       github: "https://github.com/malachyfernandez/email-peek",
@@ -1192,7 +1192,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       }));
       const count =
         parseInt(countEl?.textContent ?? "", 10) || entries.length;
-      return { count, entries };
+      return { count, entries, label };
     }
 
     feedKey(acct, containerId = 0, label = "") {
@@ -1637,14 +1637,39 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       // Nothing is new since a visit that's still going on.
       if (mode === "since_visit" && this.isOpen(key)) return { count: 0, more: false };
       if (!data) return null;
-      if (mode === "all") return { count: data.count, more: false };
+      const read = this.justRead(key, data);
+      if (mode === "all") return { count: data.count - read, more: false };
       const since = this.newSince()[key];
       if (!since) return { count: 0, more: false };
       const count = data.entries.filter(e => Date.parse(e.issued) > since).length;
       return {
-        count,
+        count: Math.max(0, count - read),
         more: count > 0 && count === data.entries.length && data.count > count,
       };
+    }
+
+    // Gmail's feed trails Gmail itself by minutes: mail read at 15:55:47
+    // was still unread in the feed at 15:58:20 and gone by 16:00:51. A
+    // loaded Gmail tab's title is live, so when its count sits a little
+    // below the feed's, that many of the feed's unread were just read —
+    // taken to be the newest, they come off the badge now instead of in
+    // ~5 minutes. Guards: the tab must be awake (a sleeping tab's title
+    // is stale and would hide new mail), the title must count the same
+    // mail as the feed (Primary vs whole inbox), and the gap must be small
+    // (a label view's "Work (5)" isn't the inbox's count).
+    justRead(key, data) {
+      if ((data.label === PRIMARY_LABEL) !== this.hasPrimary(key)) return 0;
+      for (const tab of this.findGmailTabs()) {
+        if (this.cacheKeyForTab(tab) !== key || tab.hasAttribute?.("pending")) continue;
+        if (!/^https:\/\/mail\.google\.com\//.test(tab.linkedBrowser?.currentURI?.spec || "")) continue;
+        const n = this.titleCount(tab);
+        if (n === null) continue;
+        const gap = data.count - n;
+        if (gap <= 0 || gap > 20) return 0;
+        EPDiag.log("badge", "feed behind the title", { key, title: n, feed: data.count });
+        return gap;
+      }
+      return 0;
     }
 
     onBadgePref(subject, topic, name) {

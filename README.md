@@ -109,8 +109,11 @@ For the curious; nothing below is required reading.
   per-inbox start time (`mod.gmailpeek.new_since`), set the first time the
   inbox is seen and reset whenever the mode changes. `since_visit` also
   moves it whenever you select or leave the tab; `until_read` never does.
-  Read mail drops out of the feed, and with it off the badge; the Gmail
-  tab's title changing is the cue to re-check right away. The feed lists at
+  Read mail drops out of the feed, and with it off the badge — but the feed
+  can trail Gmail by several minutes, so while the Gmail tab is awake its
+  live title count is trusted for mail just read (a gap of up to 20 below
+  the feed comes off the badge at once). The tab's title changing is also
+  the cue to re-check the feed right away. The feed lists at
   most 20 entries, so more new mail than that reads `20+`. With
   `badge_primary_only` the badge reads the Primary tab's own feed
   (`feed/atom/^sq_ig_i_personal`); the popup always lists the whole inbox.

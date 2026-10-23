@@ -1158,6 +1158,46 @@ test("Gmail badge refresh paints every tab of that inbox from the badge feed", (
   assert.ok(painted.every(([, data]) => data === primary));
 }));
 
+test("Gmail takes just-read mail off the badge before the feed catches up", () => withGmailPrefs(store => {
+  const peek = new GmailPeek();
+  // 15:55:47: one new Primary email read. Gmail's title says 3,466 at once;
+  // the feed said 3,467 until somewhere after 15:58:20.
+  const tab = (acct, title, { asleep = false } = {}) => ({
+    ...gmailTab(acct),
+    linkedBrowser: { currentURI: { spec: asleep ? "about:blank" : `https://mail.google.com/mail/u/${acct}/#inbox` } },
+    hasAttribute: name => name === "pending" && asleep,
+    getAttribute: name => (name === "label" ? title : null),
+  });
+  let tabs = [tab(0, "Inbox (3,466) - me@gmail.com - Gmail")];
+  peek.findGmailTabs = () => tabs;
+  const since = Date.parse("2026-10-23T15:41:00Z");
+  store[SINCE] = JSON.stringify({ "0@0": since, "1@0": since });
+  const primary = { count: 3467, label: "^sq_ig_i_personal", entries: [{ issued: "2026-10-23T15:52:00Z" }] };
+  assert.equal(peek.badgeCount("0@0", primary).count, 0, "read in Gmail: off the badge now");
+
+  tabs = [tab(0, "Inbox (3,467) - me@gmail.com - Gmail")];
+  assert.equal(peek.badgeCount("0@0", primary).count, 1, "title agrees: still unread");
+  tabs = [tab(0, "Inbox (3,468) - me@gmail.com - Gmail")];
+  assert.equal(peek.badgeCount("0@0", primary).count, 1, "title ahead (new mail): never adds or hides");
+  tabs = [tab(0, "Inbox (3,466) - me@gmail.com - Gmail", { asleep: true })];
+  assert.equal(peek.badgeCount("0@0", primary).count, 1, "a sleeping tab's title is stale — new mail must show");
+  tabs = [tab(0, "Work (5) - me@gmail.com - Gmail")];
+  assert.equal(peek.badgeCount("0@0", primary).count, 1, "a label view's count isn't the inbox's");
+  tabs = [tab(0, "Inbox (3,466) - me@gmail.com - Gmail")];
+  assert.equal(peek.badgeCount("0@0", { ...primary, label: "" }).count, 1,
+    "Primary-count title vs whole-inbox feed don't compare");
+
+  // The work account has no Primary tab: its title counts the whole inbox.
+  store["mod.gmailpeek.has_primary"] = JSON.stringify({ "1@0": false });
+  tabs = [tab(1, "Inbox (597) - me@work.edu - Gmail")];
+  const inbox = { count: 598, label: "", entries: [{ issued: "2026-10-23T15:52:00Z" }] };
+  assert.equal(peek.badgeCount("1@0", inbox).count, 0);
+
+  store[MODE] = "all";
+  tabs = [tab(0, "Inbox (3,466) - me@gmail.com - Gmail")];
+  assert.equal(peek.badgeCount("0@0", primary).count, 3466, "all mode shows Gmail's own live count");
+}));
+
 test("every provider script carries the shared diagnostics core", () => {
   for (const f of ["gmail-peek.uc.js", "proton-peek.uc.js", "outlook-peek.uc.js", "icloud-peek.uc.js"]) {
     const src = readFileSync(new URL("./" + f, import.meta.url), "utf8");
