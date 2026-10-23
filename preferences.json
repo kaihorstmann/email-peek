@@ -25,7 +25,7 @@
   },
   {
     "property": "mod.gmailpeek.show_badge",
-    "label": "Show an unread-count badge on the tab icon",
+    "label": "Show a badge on the tab icon counting unread mail that arrived since your last visit",
     "type": "checkbox",
     "defaultValue": true
   },

@@ -29,7 +29,7 @@
   // renders the whole report into a real browser tab — plain HTML, plain
   // links, no chrome APIs required at click time.
   const EPDiag = (window.__EPDiag ||= (() => {
-    const VERSION = "1.8.1";
+    const VERSION = "1.9.0";
     const CONTACT = {
       email: "malachyfernandez@gmail.com",
       github: "https://github.com/malachyfernandez/email-peek",
@@ -385,6 +385,8 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
     `https://mail.google.com/mail/u/${encodeURIComponent(acct)}/#inbox`;
   const composeUrl = acct =>
     `https://mail.google.com/mail/u/${encodeURIComponent(acct)}/#inbox?compose=new`;
+  // JSON { "acct@container": ms } — when each inbox's page was last open.
+  const SEEN_PREF = "mod.gmailpeek.last_seen";
 
   // ContextualIdentityService isn't always a window global in the chrome
   // context — fall back to the module so container lookups are reliable.
@@ -637,6 +639,8 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       this.onHoverOut = this.onHoverOut.bind(this);
       this.onPopupShowing = this.onPopupShowing.bind(this);
       this.onClick = this.onClick.bind(this);
+      this.onTabSelect = this.onTabSelect.bind(this);
+      this.repaintBadges = this.repaintBadges.bind(this);
     }
 
     init() {
@@ -674,6 +678,11 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
         gBrowser.tabContainer?.addEventListener("TabAttrModified", () => this.scanTabs());
         gBrowser.tabContainer?.addEventListener("TabPinned", () => this.scanTabs());
         gBrowser.tabContainer?.addEventListener("TabUnpinned", () => this.scanTabs());
+        gBrowser.tabContainer?.addEventListener("TabSelect", this.onTabSelect);
+      } catch {}
+      // A visit in any window moves the shared last-seen mark — repaint.
+      try {
+        Services.prefs.addObserver(SEEN_PREF, this.repaintBadges);
       } catch {}
 
       window.addEventListener("unload", () => this.destroy(), { once: true });
@@ -692,6 +701,9 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       clearTimeout(this.hoverTimer);
       clearTimeout(this.hideTimer);
       this.observer?.disconnect();
+      try {
+        Services.prefs.removeObserver(SEEN_PREF, this.repaintBadges);
+      } catch {}
       document.removeEventListener("mouseover", this.onHoverIn, true);
       document.removeEventListener("pointerover", this.onHoverIn, true);
       document.removeEventListener("mouseout", this.onHoverOut, true);
@@ -1477,7 +1489,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       try {
         const cache = await this.getFeed(acct, containerId, true, tab);
         if (sequence !== this.refreshSequence || this.currentTab !== tab || this.panel.state === "closed") return;
-        if (cache.data) this.paintBadge(tab, cache.data.count);
+        if (cache.data) this.paintBadge(tab, cache.data);
         this.render(cache, acct, tab);
       } finally {
         if (sequence === this.refreshSequence && this.currentTab === tab && this.panel.state !== "closed") {
@@ -1538,6 +1550,65 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
     }
 
     // ---------- badge ----------
+    // The badge counts unread mail that arrived since the inbox's page was
+    // last open — not the inbox total. Marks live in a pref so they survive
+    // restarts and are shared by every window.
+
+    lastSeen() {
+      try {
+        const seen = JSON.parse(sPref(SEEN_PREF, "{}"));
+        return seen && typeof seen === "object" ? seen : {};
+      } catch {
+        return {};
+      }
+    }
+
+    markSeen(keys) {
+      const seen = this.lastSeen();
+      const now = Date.now();
+      for (const key of keys) seen[key] = now;
+      EPDiag.log("badge", "seen", { keys });
+      try {
+        Services.prefs.setStringPref(SEEN_PREF, JSON.stringify(seen));
+      } catch {}
+    }
+
+    // The inbox's page is the selected tab, so nothing on it is new.
+    isOpen(key) {
+      const tab = window.gBrowser?.selectedTab;
+      return !!tab && this.isGmailTab(tab) && this.cacheKeyForTab(tab) === key;
+    }
+
+    // Arriving at and leaving a Gmail tab both count as a visit.
+    onTabSelect(e) {
+      const keys = [e.target, e.detail?.previousTab]
+        .filter(tab => tab && this.isGmailTab(tab))
+        .map(tab => this.cacheKeyForTab(tab));
+      if (keys.length) this.markSeen(keys);
+    }
+
+    // Unread entries issued after the last visit, or null with no feed to
+    // judge by. The feed lists at most 20 entries, so when every one is new
+    // and Gmail reports more unread, the true figure is "at least" (more).
+    newMail(key, data) {
+      if (this.isOpen(key)) return { count: 0, more: false };
+      if (!data) return null;
+      const since = this.lastSeen()[key];
+      if (!since) return { count: 0, more: false };
+      const count = data.entries.filter(e => Date.parse(e.issued) > since).length;
+      return {
+        count,
+        more: count > 0 && count === data.entries.length && data.count > count,
+      };
+    }
+
+    // Cache-only repaint (no fetch) for when a last-seen mark moves.
+    repaintBadges() {
+      if (!bPref("mod.gmailpeek.show_badge", true)) return;
+      for (const tab of this.findGmailTabs()) {
+        this.paintBadge(tab, this.caches.get(this.cacheKeyForTab(tab))?.data);
+      }
+    }
 
     async refreshBadge() {
       this.scanTabs();
@@ -1556,16 +1627,20 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
         }
         byKey.get(key).tabs.push(tab);
       }
-      for (const { acct, containerId, tabs: acctTabs } of byKey.values()) {
+      for (const [key, { acct, containerId, tabs: acctTabs }] of byKey) {
+        // A first sighting sets the baseline instead of badging the whole
+        // inbox. While the page is open the mark keeps moving, so quitting
+        // mid-visit doesn't resurface what was on screen.
+        if (!this.lastSeen()[key] || this.isOpen(key)) this.markSeen([key]);
         const cache = await this.getFeed(acct, containerId, false, acctTabs[0]);
         if (cache.error || !cache.data) continue;
         for (const tab of acctTabs) {
-          this.paintBadge(tab, cache.data.count);
+          this.paintBadge(tab, cache.data);
         }
       }
     }
 
-    paintBadge(tab, count) {
+    paintBadge(tab, data) {
       // The feed await in refresh() can outlive a claim — a tab that has
       // since navigated away (or was claimed while lazy and resolves to a
       // non-Gmail page) must not carry our badge.
@@ -1577,7 +1652,10 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
         this.boundTabs.delete(tab);
         return;
       }
-      EPDiag.log("badge", "paint", { count, tab: EPDiag.tabInfo(tab) });
+      const mail = this.newMail(this.cacheKeyForTab(tab), data);
+      if (!mail) return;
+      const { count, more } = mail;
+      EPDiag.log("badge", "paint", { count, more, tab: EPDiag.tabInfo(tab) });
       const host =
         tab.shadowRoot?.querySelector(".tab-icon-stack") ||
         tab.shadowRoot?.querySelector(".tab-content") ||
@@ -1594,7 +1672,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
           badge.style.cssText = BADGE_STYLE;
           host.appendChild(badge);
         }
-        badge.textContent = count > 99 ? "99+" : String(count);
+        badge.textContent = count > 99 ? "99+" : `${count}${more ? "+" : ""}`;
       } else {
         badge?.remove();
       }
