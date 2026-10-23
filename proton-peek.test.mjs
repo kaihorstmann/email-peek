@@ -893,15 +893,18 @@ test("Gmail title fallback ignores pages that merely mention Gmail", () => {
   assert.equal(peek.isGmailTab(lazy("Gmail")), true);
 });
 
-// Swap in a writable string-pref store for the duration of fn.
-async function withGmailPrefs(fn) {
+// Swap in a writable pref store (strings + bools) for the duration of fn.
+async function withGmailPrefs(fn, initial = {}) {
   const previous = gmailContext.Services.prefs;
-  const store = {};
+  const store = { ...initial };
   gmailContext.Services.prefs = {
     PREF_STRING: 32,
-    getPrefType: n => (n in store ? 32 : 0),
+    PREF_BOOL: 128,
+    getPrefType: n => (!(n in store) ? 0 : typeof store[n] === "boolean" ? 128 : 32),
     getStringPref: n => store[n],
+    getBoolPref: n => store[n],
     setStringPref: (n, v) => { store[n] = v; },
+    clearUserPref: n => { delete store[n]; },
   };
   try {
     await fn(store);
@@ -910,60 +913,150 @@ async function withGmailPrefs(fn) {
   }
 }
 
+// Run fn with setTimeout queuing callbacks instead of scheduling them.
+async function withQueuedTimers(fn) {
+  const previous = gmailContext.setTimeout;
+  const queued = [];
+  gmailContext.setTimeout = (cb, ms) => { queued.push({ cb, ms }); return queued.length; };
+  try {
+    await fn(queued);
+  } finally {
+    gmailContext.setTimeout = previous;
+  }
+}
+
 const gmailTab = acct => ({
+  isConnected: true,
   linkedBrowser: { currentURI: { spec: `https://mail.google.com/mail/u/${acct}/#inbox` } },
   hasAttribute: () => false,
 });
+const SINCE = "mod.gmailpeek.new_since";
+const MODE = "mod.gmailpeek.badge_mode";
 
-test("Gmail badge counts only unread mail that arrived since the last visit", () => {
+test("Gmail new-mail badge keeps counting new mail until it is read", () => withGmailPrefs(() => {
   const peek = new GmailPeek();
-  peek.isOpen = () => false;
-  peek.lastSeen = () => ({ "0@0": Date.parse("2026-10-22T12:00:00Z") });
   const entries = ["2026-10-22T12:30:00Z", "2026-10-22T12:05:00Z", "2026-10-22T11:00:00Z", "2026-10-21T09:00:00Z"]
     .map(issued => ({ issued }));
-  const mail = peek.newMail("0@0", { count: 9, entries });
-  assert.equal(mail.count, 2);
+  const mail = peek.badgeCount("0@0", { count: 9, entries });
+  assert.equal(mail.count, 2, "only mail issued after counting began");
   assert.equal(mail.more, false);
+  assert.equal(peek.badgeCount("0@0", { count: 8, entries: entries.slice(1) }).count, 1,
+    "reading one drops it out of the feed and off the badge");
 
-  const capped = peek.newMail("0@0", { count: 30, entries: entries.slice(0, 2) });
+  const capped = peek.badgeCount("0@0", { count: 30, entries: entries.slice(0, 2) });
   assert.equal(capped.count, 2);
   assert.equal(capped.more, true, "a feed full of new mail with more unread reads as at-least");
 
-  assert.equal(peek.newMail("1@0", { count: 9, entries }).count, 0, "no visit recorded yet means nothing is new");
-  assert.equal(peek.newMail("0@0", null), null, "no feed leaves the badge alone");
-  peek.isOpen = () => true;
-  assert.equal(peek.newMail("0@0", { count: 9, entries }).count, 0, "an open inbox has nothing new");
-  assert.equal(peek.newMail("0@0", null).count, 0, "an open inbox clears even without a feed");
-});
+  assert.equal(peek.badgeCount("1@0", { count: 9, entries }).count, 0, "an inbox not yet counted shows nothing");
+  assert.equal(peek.badgeCount("0@0", null), null, "no feed leaves the badge alone");
+}, { [SINCE]: JSON.stringify({ "0@0": Date.parse("2026-10-22T12:00:00Z") }) }));
 
-test("Gmail visits mark both the tab arrived at and the tab left as seen", () => withGmailPrefs(store => {
+test("Gmail all-mail badge mode shows the inbox's total unread", () => withGmailPrefs(() => {
   const peek = new GmailPeek();
-  const other = { linkedBrowser: { currentURI: { spec: "https://example.com/" } }, hasAttribute: () => false };
-  const before = Date.now();
-  peek.onTabSelect({ target: gmailTab(1), detail: { previousTab: other } });
-  const seen = JSON.parse(store["mod.gmailpeek.last_seen"]);
-  assert.deepEqual(Object.keys(seen), ["1@0"]);
-  assert.ok(seen["1@0"] >= before);
-  peek.onTabSelect({ target: other, detail: { previousTab: gmailTab(0) } });
-  assert.deepEqual(Object.keys(JSON.parse(store["mod.gmailpeek.last_seen"])).sort(), ["0@0", "1@0"]);
-  const unchanged = store["mod.gmailpeek.last_seen"];
-  peek.onTabSelect({ target: other, detail: { previousTab: other } });
-  assert.equal(store["mod.gmailpeek.last_seen"], unchanged, "non-Gmail switches leave the marks alone");
-}));
+  const entries = [{ issued: "2026-10-22T12:30:00Z" }];
+  assert.deepEqual({ ...peek.badgeCount("0@0", { count: 42, entries }) }, { count: 42, more: false });
+}, { [MODE]: "all" }));
 
-test("Gmail badge baselines a never-visited inbox instead of showing its total", () => withGmailPrefs(async store => {
+test("Gmail first sighting starts the count instead of badging the backlog", () => withGmailPrefs(async store => {
   const peek = new GmailPeek();
   const tab = gmailTab(0);
   const painted = [];
   peek.scanTabs = () => {};
   peek.findGmailTabs = () => [tab];
-  peek.isOpen = () => false;
   peek.getFeed = async () => ({ data: { count: 3, entries: [{ issued: new Date(Date.now() - 1000).toISOString() }] } });
-  peek.paintBadge = (t, data) => painted.push(peek.newMail(peek.cacheKeyForTab(t), data).count);
+  peek.paintBadge = (t, data) => painted.push(peek.badgeCount(peek.cacheKeyForTab(t), data).count);
   await peek.refreshBadge();
-  assert.ok(JSON.parse(store["mod.gmailpeek.last_seen"])["0@0"], "first sighting records a baseline");
+  assert.ok(JSON.parse(store[SINCE])["0@0"], "first sighting records a start time");
   assert.deepEqual(painted, [0]);
+  const started = store[SINCE];
+  await peek.refreshBadge();
+  assert.equal(store[SINCE], started, "later refreshes never move the start time");
 }));
+
+test("Gmail all mode records no start times", () => withGmailPrefs(async store => {
+  const peek = new GmailPeek();
+  peek.scanTabs = () => {};
+  peek.findGmailTabs = () => [gmailTab(0)];
+  peek.getFeed = async () => ({ data: { count: 3, entries: [] } });
+  peek.paintBadge = () => {};
+  await peek.refreshBadge();
+  assert.ok(!(SINCE in store));
+}, { [MODE]: "all" }));
+
+test("Gmail switching the badge to new mail starts the count over", () => withQueuedTimers(queued =>
+  withGmailPrefs(store => {
+    const peek = new GmailPeek();
+    let refreshes = 0;
+    peek.refreshBadge = () => { refreshes++; };
+    peek.onBadgePref(null, "nsPref:changed", MODE);
+    assert.ok(!(SINCE in store), "start times cleared");
+    assert.equal(refreshes, 0, "refresh waits until every window has cleared");
+    queued.forEach(t => t.cb());
+    assert.equal(refreshes, 1);
+
+    store[MODE] = "since_visit";
+    store[SINCE] = "{}";
+    peek.onBadgePref(null, "nsPref:changed", MODE);
+    assert.ok(!(SINCE in store), "either new-mail mode starts over");
+
+    store[MODE] = "all";
+    store[SINCE] = "{}";
+    peek.onBadgePref(null, "nsPref:changed", MODE);
+    assert.equal(store[SINCE], "{}", "switching to all keeps them");
+  }, { [MODE]: "until_read", [SINCE]: JSON.stringify({ "0@0": 1 }) })));
+
+test("Gmail since-visit mode: visits restart the count, until-read mode ignores them", () => withGmailPrefs(store => {
+  const peek = new GmailPeek();
+  const other = { linkedBrowser: { currentURI: { spec: "https://example.com/" } }, hasAttribute: () => false };
+  const before = Date.now();
+  peek.onTabSelect({ target: gmailTab(1), detail: { previousTab: other } });
+  const since = JSON.parse(store[SINCE]);
+  assert.deepEqual(Object.keys(since), ["1@0"], "arriving at a Gmail tab counts as a visit");
+  assert.ok(since["1@0"] >= before);
+  peek.onTabSelect({ target: other, detail: { previousTab: gmailTab(0) } });
+  assert.deepEqual(Object.keys(JSON.parse(store[SINCE])).sort(), ["0@0", "1@0"], "so does leaving one");
+  const unchanged = store[SINCE];
+  peek.onTabSelect({ target: other, detail: { previousTab: other } });
+  assert.equal(store[SINCE], unchanged, "non-Gmail switches leave the times alone");
+
+  store[MODE] = "until_read";
+  peek.onTabSelect({ target: gmailTab(2), detail: { previousTab: other } });
+  assert.equal(store[SINCE], unchanged, "until_read: visiting never clears the badge");
+}, { [MODE]: "since_visit" }));
+
+test("Gmail open inbox shows no new mail only in since-visit mode", () => withGmailPrefs(store => {
+  const peek = new GmailPeek();
+  peek.isOpen = () => true;
+  const data = { count: 2, entries: [{ issued: "2026-10-22T12:30:00Z" }] };
+  assert.equal(peek.badgeCount("0@0", data).count, 0, "since_visit: the visit is still going on");
+  assert.equal(peek.badgeCount("0@0", null).count, 0, "and clears even without a feed");
+  store[MODE] = "until_read";
+  assert.equal(peek.badgeCount("0@0", data).count, 1, "until_read: still counted while you look at it");
+}, { [MODE]: "since_visit", [SINCE]: JSON.stringify({ "0@0": Date.parse("2026-10-22T12:00:00Z") }) }));
+
+test("Gmail title changes re-check that inbox right away", () => withQueuedTimers(queued => {
+  const peek = new GmailPeek();
+  const tab = gmailTab(0);
+  const checked = [];
+  peek.refreshBadgeFor = t => checked.push(t);
+  peek.gmailTabs.add(tab);
+  peek.onTabAttrModified({ target: tab, detail: { changed: ["busy"] } });
+  peek.onTabAttrModified({ target: gmailTab(1), detail: { changed: ["label"] } });
+  assert.equal(queued.length, 0, "other attributes and unclaimed tabs are ignored");
+  peek.onTabAttrModified({ target: tab, detail: { changed: ["label"] } });
+  assert.equal(queued.length, 1);
+  queued[0].cb();
+  assert.deepEqual(checked, [tab]);
+}));
+
+test("Gmail badge comes off when the badge setting is turned off", () => withGmailPrefs(() => {
+  const peek = new GmailPeek();
+  const badge = { removed: false, remove() { this.removed = true; } };
+  const host = { querySelector: sel => (sel === ".gmailpeek-badge" ? badge : null) };
+  const tab = { ...gmailTab(0), querySelector: sel => (sel === ".tab-icon-stack" ? host : null) };
+  peek.paintBadge(tab, { count: 5, entries: [] });
+  assert.ok(badge.removed);
+}, { "mod.gmailpeek.show_badge": false, [MODE]: "all" }));
 
 test("every provider script carries the shared diagnostics core", () => {
   for (const f of ["gmail-peek.uc.js", "proton-peek.uc.js", "outlook-peek.uc.js", "icloud-peek.uc.js"]) {

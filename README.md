@@ -14,9 +14,11 @@ through the session you're already signed in with.
 ## What you get
 
 - **Unread mail only.** If the list is empty, congratulations — you're done.
-- **Unread-count badge** right on the tab icon. On Gmail it counts only
-  unread mail that arrived since you last had the tab open, and clears when
-  you visit it.
+- **Unread-count badge** right on the tab icon. On Gmail it counts, by
+  default, only mail that arrived after Email Peek started watching that
+  inbox, and each one stays on the badge until you read it — the old unread
+  backlog never counts. The settings can instead clear it whenever you visit
+  the tab, or count all unread mail.
 - **Refreshes every time you hover.** The bottom-left corner narrates
   `Refreshing.` → `..` → `...`, then settles into `Refreshed 12:34 PM`
   so you always know how stale the list isn't.
@@ -87,7 +89,8 @@ In Sine → Mod Settings (or `about:config`):
 | `mod.gmailpeek.max_items` | `6` | Emails shown in the popup |
 | `mod.gmailpeek.hover_delay` | `400` | ms before the preview opens |
 | `mod.gmailpeek.hide_delay` | `150` | ms before the preview closes on mouse-out |
-| `mod.gmailpeek.show_badge` | `true` | Badge on the tab icon: unread mail since your last visit |
+| `mod.gmailpeek.show_badge` | `true` | Unread badge on the tab icon |
+| `mod.gmailpeek.badge_mode` | `until_read` | `until_read`: new mail, until it's read · `since_visit`: new mail since you last had the tab open · `all`: every unread email |
 
 The Proton, Outlook, and iCloud halves take the same set under
 `mod.protonpeek.*`, `mod.outlookpeek.*`, and `mod.icloudpeek.*`, each with
@@ -101,10 +104,13 @@ For the curious; nothing below is required reading.
   browser's chrome context, riding your existing session cookies — including
   the tab's own cookie jar, so container and private-window sessions work.
   The feed only ever contains unread mail, which is exactly what the popup
-  shows. The badge counts feed entries issued after your last visit —
-  selecting or leaving the tab moves a per-account mark stored in
-  `mod.gmailpeek.last_seen`. The feed lists at most 20 entries, so a
-  backlog bigger than that reads `20+`.
+  shows. The two "new" badge modes count feed entries issued after a
+  per-inbox start time (`mod.gmailpeek.new_since`), set the first time the
+  inbox is seen and reset whenever the mode changes. `since_visit` also
+  moves it whenever you select or leave the tab; `until_read` never does.
+  Read mail drops out of the feed, and with it off the badge; the Gmail
+  tab's title changing is the cue to re-check right away. The feed lists at
+  most 20 entries, so more new mail than that reads `20+`.
 - **Proton** has no Atom feed and its API payload is end-to-end encrypted,
   so the mod keeps a hidden 1×1 `<browser>` per account — always loaded,
   never asleep, sharing the normal cookie jar — pointed at your mailbox view

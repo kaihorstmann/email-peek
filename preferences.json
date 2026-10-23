@@ -25,9 +25,21 @@
   },
   {
     "property": "mod.gmailpeek.show_badge",
-    "label": "Show a badge on the tab icon counting unread mail that arrived since your last visit",
+    "label": "Show an unread-count badge on the tab icon",
     "type": "checkbox",
     "defaultValue": true
+  },
+  {
+    "property": "mod.gmailpeek.badge_mode",
+    "label": "What the Gmail badge counts",
+    "type": "dropdown",
+    "defaultValue": "until_read",
+    "placeholder": false,
+    "options": [
+      { "label": "New mail — stays until it's read", "value": "until_read" },
+      { "label": "New mail since your last visit — clears when you visit", "value": "since_visit" },
+      { "label": "All unread mail", "value": "all" }
+    ]
   },
   {
     "property": "mod.protonpeek.enabled",
