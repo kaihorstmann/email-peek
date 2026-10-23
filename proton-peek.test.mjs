@@ -1058,6 +1058,58 @@ test("Gmail badge comes off when the badge setting is turned off", () => withGma
   assert.ok(badge.removed);
 }, { "mod.gmailpeek.show_badge": false, [MODE]: "all" }));
 
+test("Gmail Primary feed is its own URL and cache entry", async () => {
+  const peek = new GmailPeek();
+  const previous = gmailContext.fetch;
+  const urls = [];
+  gmailContext.fetch = async url => { urls.push(url); return { url, ok: false, status: 401 }; };
+  try {
+    await peek.getFeed("1", 0, true, null, "^sq_ig_i_personal");
+  } finally {
+    gmailContext.fetch = previous;
+  }
+  assert.deepEqual(urls, ["https://mail.google.com/mail/u/1/feed/atom/%5Esq_ig_i_personal"]);
+  assert.ok(peek.caches.has("1@0/^sq_ig_i_personal"));
+  assert.ok(!peek.caches.has("1@0"), "the popup's whole-inbox cache is untouched");
+});
+
+test("Gmail badge reads the Primary feed and falls back to the inbox", () => withGmailPrefs(async store => {
+  const peek = new GmailPeek();
+  const asked = [];
+  const primary = { data: { count: 1, entries: [] }, error: null };
+  const inbox = { data: { count: 9, entries: [] }, error: null };
+  let primaryWorks = true;
+  peek.getFeed = async (acct, ctx, force, tab, label = "") => {
+    asked.push(label);
+    return label ? (primaryWorks ? primary : { data: null, error: "HTTP 404" }) : inbox;
+  };
+  assert.equal(await peek.badgeFeed("0", 0, false, null), primary);
+  assert.deepEqual(asked, ["^sq_ig_i_personal"], "on by default, and only Primary is fetched");
+
+  asked.length = 0;
+  primaryWorks = false;
+  assert.equal(await peek.badgeFeed("0", 0, false, null), inbox);
+  assert.deepEqual(asked, ["^sq_ig_i_personal", ""], "no Primary feed: count the whole inbox");
+
+  asked.length = 0;
+  store["mod.gmailpeek.badge_primary_only"] = false;
+  assert.equal(await peek.badgeFeed("0", 0, false, null), inbox);
+  assert.deepEqual(asked, [""], "setting off: whole inbox only");
+}));
+
+test("Gmail badge refresh paints every tab of that inbox from the badge feed", () => withGmailPrefs(async () => {
+  const peek = new GmailPeek();
+  const a = gmailTab(0), b = gmailTab(0), other = gmailTab(1);
+  const painted = [];
+  const primary = { count: 1, entries: [] };
+  peek.findGmailTabs = () => [a, b, other];
+  peek.getFeed = async (acct, ctx, force, tab, label) => ({ data: label ? primary : { count: 9, entries: [] } });
+  peek.paintBadge = (tab, data) => painted.push([tab, data]);
+  await peek.refreshBadgeFor(a);
+  assert.deepEqual(painted.map(([tab]) => tab), [a, b]);
+  assert.ok(painted.every(([, data]) => data === primary));
+}));
+
 test("every provider script carries the shared diagnostics core", () => {
   for (const f of ["gmail-peek.uc.js", "proton-peek.uc.js", "outlook-peek.uc.js", "icloud-peek.uc.js"]) {
     const src = readFileSync(new URL("./" + f, import.meta.url), "utf8");

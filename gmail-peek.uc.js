@@ -29,7 +29,7 @@
   // renders the whole report into a real browser tab — plain HTML, plain
   // links, no chrome APIs required at click time.
   const EPDiag = (window.__EPDiag ||= (() => {
-    const VERSION = "1.9.1";
+    const VERSION = "1.9.2";
     const CONTACT = {
       email: "malachyfernandez@gmail.com",
       github: "https://github.com/malachyfernandez/email-peek",
@@ -379,8 +379,10 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
   // Default account index when a tab's URL doesn't carry /u/N/.
   const defaultAccount = () =>
     sPref("mod.gmailpeek.account", "0").trim() || "0";
-  const feedUrl = acct =>
-    `https://mail.google.com/mail/u/${encodeURIComponent(acct)}/feed/atom`;
+  // No label: the whole inbox. A label narrows the feed to it.
+  const feedUrl = (acct, label = "") =>
+    `https://mail.google.com/mail/u/${encodeURIComponent(acct)}/feed/atom` +
+    (label ? `/${encodeURIComponent(label)}` : "");
   const inboxUrl = acct =>
     `https://mail.google.com/mail/u/${encodeURIComponent(acct)}/#inbox`;
   const composeUrl = acct =>
@@ -389,6 +391,10 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
   const MODE_PREF = "mod.gmailpeek.badge_mode";
   // JSON { "acct@container": ms } — new mail is mail issued after this.
   const SINCE_PREF = "mod.gmailpeek.new_since";
+  // When on, the badge counts only the Primary inbox tab.
+  const PRIMARY_PREF = "mod.gmailpeek.badge_primary_only";
+  // Gmail's label for the Primary tab.
+  const PRIMARY_LABEL = "^sq_ig_i_personal";
 
   // ContextualIdentityService isn't always a window global in the chrome
   // context — fall back to the module so container lookups are reliable.
@@ -689,6 +695,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       try {
         Services.prefs.addObserver(MODE_PREF, this.onBadgePref);
         Services.prefs.addObserver("mod.gmailpeek.show_badge", this.onBadgePref);
+        Services.prefs.addObserver(PRIMARY_PREF, this.onBadgePref);
         // A visit in any window moves the shared start time — repaint.
         Services.prefs.addObserver(SINCE_PREF, this.repaintBadges);
       } catch {}
@@ -714,6 +721,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       try {
         Services.prefs.removeObserver(MODE_PREF, this.onBadgePref);
         Services.prefs.removeObserver("mod.gmailpeek.show_badge", this.onBadgePref);
+        Services.prefs.removeObserver(PRIMARY_PREF, this.onBadgePref);
         Services.prefs.removeObserver(SINCE_PREF, this.repaintBadges);
       } catch {}
       document.removeEventListener("mouseover", this.onHoverIn, true);
@@ -1107,10 +1115,11 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       });
     }
 
-    async fetchFeed(acct, containerId = 0, tab = null) {
-      const url = feedUrl(acct);
+    async fetchFeed(acct, containerId = 0, tab = null, label = "") {
+      const url = feedUrl(acct, label);
       const t0 = Date.now();
       const meta = { acct, ctx: containerId };
+      if (label) meta.label = label;
       let text;
       if (containerId > 0) {
         EPDiag.log("feed", "request", { acct, url, ctx: containerId, via: "xpcom" });
@@ -1184,8 +1193,12 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       return { count, entries };
     }
 
-    getFeed(acct, containerId = 0, force = false, tab = null) {
-      const key = `${acct}@${containerId}`;
+    feedKey(acct, containerId = 0, label = "") {
+      return `${acct}@${containerId}${label ? `/${label}` : ""}`;
+    }
+
+    getFeed(acct, containerId = 0, force = false, tab = null, label = "") {
+      const key = this.feedKey(acct, containerId, label);
       let cache = this.caches.get(key);
       if (!cache) {
         cache = { t: 0, data: null, error: null };
@@ -1195,11 +1208,11 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
         EPDiag.log("feed", "cache hit", { key, ageMs: Date.now() - cache.t, hasData: !!cache.data, err: cache.error });
         return Promise.resolve(cache);
       }
-      EPDiag.log("feed", "get", { acct, ctx: containerId, force });
+      EPDiag.log("feed", "get", { acct, ctx: containerId, force, label: label || undefined });
       if (!this.inflights.has(key)) {
         this.inflights.set(
           key,
-          this.fetchFeed(acct, containerId, tab)
+          this.fetchFeed(acct, containerId, tab, label)
             .then(data => {
               const t = Date.now();
               this.caches.set(key, { t, refreshedAt: t, data, error: null });
@@ -1501,7 +1514,9 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       try {
         const cache = await this.getFeed(acct, containerId, true, tab);
         if (sequence !== this.refreshSequence || this.currentTab !== tab || this.panel.state === "closed") return;
-        if (cache.data) this.paintBadge(tab, cache.data);
+        // The badge may read a different feed (Primary only) than the
+        // popup — with the whole inbox it hits the cache just filled.
+        if (cache.data) this.refreshBadgeFor(tab, false);
         this.render(cache, acct, tab);
       } finally {
         if (sequence === this.refreshSequence && this.currentTab === tab && this.panel.state !== "closed") {
@@ -1645,8 +1660,26 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
     // Cache-only repaint (no fetch) for when a start time moves.
     repaintBadges() {
       for (const tab of this.findGmailTabs()) {
-        this.paintBadge(tab, this.caches.get(this.cacheKeyForTab(tab))?.data);
+        const key = this.feedKey(
+          this.accountForTab(tab), this.containerForTab(tab), this.badgeLabel());
+        this.paintBadge(tab, this.caches.get(key)?.data);
       }
+    }
+
+    // The feed the badge counts from: the Primary tab's when
+    // badge_primary_only is on, so Promotions, Social, Updates and Forums
+    // don't count; otherwise the whole inbox.
+    badgeLabel() {
+      return bPref(PRIMARY_PREF, true) ? PRIMARY_LABEL : "";
+    }
+
+    async badgeFeed(acct, containerId, force, tab) {
+      const label = this.badgeLabel();
+      const cache = await this.getFeed(acct, containerId, force, tab, label);
+      if (!label || cache.data) return cache;
+      // No Primary feed for this account — count the whole inbox instead.
+      EPDiag.log("badge", "Primary feed unavailable, using inbox", { acct, ctx: containerId, err: cache.error });
+      return this.getFeed(acct, containerId, force, tab);
     }
 
     // Reading mail changes the Gmail tab's title ("Inbox (3)" → "(2)"), so
@@ -1659,11 +1692,11 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       tab._gpTitleTimer = setTimeout(() => this.refreshBadgeFor(tab), 2000);
     }
 
-    async refreshBadgeFor(tab) {
+    async refreshBadgeFor(tab, force = true) {
       if (!tab.isConnected || !this.isGmailTab(tab)) return;
       const key = this.cacheKeyForTab(tab);
-      const cache = await this.getFeed(
-        this.accountForTab(tab), this.containerForTab(tab), true, tab);
+      const cache = await this.badgeFeed(
+        this.accountForTab(tab), this.containerForTab(tab), force, tab);
       if (!cache.data) return;
       for (const t of this.findGmailTabs()) {
         if (this.cacheKeyForTab(t) === key) this.paintBadge(t, cache.data);
@@ -1701,7 +1734,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
             (!this.newSince()[key] || (mode === "since_visit" && this.isOpen(key)))) {
           this.countFromNow([key]);
         }
-        const cache = await this.getFeed(acct, containerId, false, acctTabs[0]);
+        const cache = await this.badgeFeed(acct, containerId, false, acctTabs[0]);
         if (cache.error || !cache.data) continue;
         for (const tab of acctTabs) {
           this.paintBadge(tab, cache.data);

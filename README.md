@@ -91,6 +91,7 @@ In Sine → Mod Settings (or `about:config`):
 | `mod.gmailpeek.hide_delay` | `150` | ms before the preview closes on mouse-out |
 | `mod.gmailpeek.show_badge` | `true` | Unread badge on the tab icon |
 | `mod.gmailpeek.badge_mode` | `until_read` | `until_read`: new mail, until it's read · `since_visit`: new mail since you last had the tab open · `all`: every unread email |
+| `mod.gmailpeek.badge_primary_only` | `true` | Badge counts only the Primary inbox tab, not Promotions, Social, Updates or Forums |
 
 The Proton, Outlook, and iCloud halves take the same set under
 `mod.protonpeek.*`, `mod.outlookpeek.*`, and `mod.icloudpeek.*`, each with
@@ -110,7 +111,12 @@ For the curious; nothing below is required reading.
   moves it whenever you select or leave the tab; `until_read` never does.
   Read mail drops out of the feed, and with it off the badge; the Gmail
   tab's title changing is the cue to re-check right away. The feed lists at
-  most 20 entries, so more new mail than that reads `20+`.
+  most 20 entries, so more new mail than that reads `20+`. With
+  `badge_primary_only` the badge reads the Primary tab's own feed
+  (`feed/atom/^sq_ig_i_personal`) and falls back to the whole inbox if that
+  feed can't be loaded; the popup always lists the whole inbox. The feed
+  can't tell whether an account has inbox tabs turned on, so for an account
+  without them, switch the setting off.
 - **Proton** has no Atom feed and its API payload is end-to-end encrypted,
   so the mod keeps a hidden 1×1 `<browser>` per account — always loaded,
   never asleep, sharing the normal cookie jar — pointed at your mailbox view

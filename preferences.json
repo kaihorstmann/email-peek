@@ -42,6 +42,12 @@
     ]
   },
   {
+    "property": "mod.gmailpeek.badge_primary_only",
+    "label": "Gmail badge counts only the Primary inbox tab — Promotions, Social, Updates and Forums don't count",
+    "type": "checkbox",
+    "defaultValue": true
+  },
+  {
     "property": "mod.protonpeek.enabled",
     "label": "Proton Peek — enable hover previews for pinned Proton Mail tabs",
     "type": "checkbox",
