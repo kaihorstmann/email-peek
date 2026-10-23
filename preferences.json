@@ -43,7 +43,7 @@
   },
   {
     "property": "mod.gmailpeek.badge_primary_only",
-    "label": "Gmail badge counts only the Primary inbox tab — Promotions, Social, Updates and Forums don't count",
+    "label": "Gmail badge counts only the Primary inbox tab, for accounts that have one — Promotions, Social, Updates and Forums don't count",
     "type": "checkbox",
     "defaultValue": true
   },

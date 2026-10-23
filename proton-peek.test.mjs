@@ -1079,22 +1079,70 @@ test("Gmail badge reads the Primary feed and falls back to the inbox", () => wit
   const primary = { data: { count: 1, entries: [] }, error: null };
   const inbox = { data: { count: 9, entries: [] }, error: null };
   let primaryWorks = true;
+  peek.findGmailTabs = () => [];
   peek.getFeed = async (acct, ctx, force, tab, label = "") => {
     asked.push(label);
     return label ? (primaryWorks ? primary : { data: null, error: "HTTP 404" }) : inbox;
   };
   assert.equal(await peek.badgeFeed("0", 0, false, null), primary);
-  assert.deepEqual(asked, ["^sq_ig_i_personal"], "on by default, and only Primary is fetched");
+  assert.deepEqual(asked, ["^sq_ig_i_personal", ""], "on by default; both feeds fetched to compare");
 
   asked.length = 0;
   primaryWorks = false;
-  assert.equal(await peek.badgeFeed("0", 0, false, null), inbox);
-  assert.deepEqual(asked, ["^sq_ig_i_personal", ""], "no Primary feed: count the whole inbox");
+  assert.equal(await peek.badgeFeed("0", 0, false, null), inbox, "no Primary feed: count the whole inbox");
 
   asked.length = 0;
   store["mod.gmailpeek.badge_primary_only"] = false;
   assert.equal(await peek.badgeFeed("0", 0, false, null), inbox);
   assert.deepEqual(asked, [""], "setting off: whole inbox only");
+}));
+
+test("Gmail title count is read in any locale's number format", () => {
+  const peek = new GmailPeek();
+  const titled = label => ({ getAttribute: name => (name === "label" ? label : null) });
+  assert.equal(peek.titleCount(titled("Inbox (3,466) - a@gmail.com - Gmail")), 3466);
+  assert.equal(peek.titleCount(titled("Posteingang (3.466) - a@gmail.com - Gmail")), 3466);
+  assert.equal(peek.titleCount(titled("Boîte de réception (3 466) - a@gmail.com - Gmail")), 3466);
+  assert.equal(peek.titleCount(titled("Inbox - a@gmail.com - Gmail")), null);
+});
+
+test("Gmail detects per account whether there is a Primary tab", () => withGmailPrefs(async store => {
+  const peek = new GmailPeek();
+  // The two real accounts this was built for: u/0 has inbox tabs, u/1
+  // (work) doesn't — its Primary feed is empty while the inbox has 597.
+  const tab = (acct, title) => ({
+    ...gmailTab(acct),
+    getAttribute: name => (name === "label" ? title : null),
+  });
+  const personal = tab(0, "Inbox (3,466) - me@gmail.com - Gmail");
+  const work = tab(1, "Inbox (597) - me@work.edu - Gmail");
+  peek.findGmailTabs = () => [personal, work];
+  const feeds = {
+    "0": { primary: { count: 3466, entries: [] }, inbox: { count: 3510, entries: [] } },
+    "1": { primary: { count: 0, entries: [] }, inbox: { count: 597, entries: [] } },
+  };
+  peek.getFeed = async (acct, ctx, force, t, label = "") =>
+    ({ data: feeds[acct][label ? "primary" : "inbox"], error: null });
+
+  assert.equal((await peek.badgeFeed("0", 0, false, personal)).data, feeds["0"].primary);
+  assert.equal((await peek.badgeFeed("1", 0, false, work)).data, feeds["1"].inbox,
+    "no Primary tab: the work account's badge counts its whole inbox");
+  assert.deepEqual(JSON.parse(store["mod.gmailpeek.has_primary"]), { "0@0": true, "1@0": false });
+
+  // The answer sticks when there's nothing to tell it by — feeds that agree,
+  // or a title a beat behind that matches neither.
+  feeds["1"].primary = { count: 597, entries: [] };
+  assert.equal((await peek.badgeFeed("1", 0, false, work)).data, feeds["1"].inbox);
+  feeds["1"].primary = { count: 0, entries: [] };
+  feeds["1"].inbox = { count: 598, entries: [] };
+  assert.equal((await peek.badgeFeed("1", 0, false, work)).data, feeds["1"].inbox);
+  assert.equal(JSON.parse(store["mod.gmailpeek.has_primary"])["1@0"], false);
+
+  // Remembered across restarts.
+  const later = new GmailPeek();
+  assert.equal(later.hasPrimary("1@0"), false);
+  assert.equal(later.hasPrimary("0@0"), true);
+  assert.equal(later.hasPrimary("2@0"), true, "unknown inboxes default to Primary");
 }));
 
 test("Gmail badge refresh paints every tab of that inbox from the badge feed", () => withGmailPrefs(async () => {

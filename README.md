@@ -91,7 +91,7 @@ In Sine → Mod Settings (or `about:config`):
 | `mod.gmailpeek.hide_delay` | `150` | ms before the preview closes on mouse-out |
 | `mod.gmailpeek.show_badge` | `true` | Unread badge on the tab icon |
 | `mod.gmailpeek.badge_mode` | `until_read` | `until_read`: new mail, until it's read · `since_visit`: new mail since you last had the tab open · `all`: every unread email |
-| `mod.gmailpeek.badge_primary_only` | `true` | Badge counts only the Primary inbox tab, not Promotions, Social, Updates or Forums |
+| `mod.gmailpeek.badge_primary_only` | `true` | Badge counts only the Primary inbox tab, not Promotions, Social, Updates or Forums — on accounts that have inbox tabs |
 
 The Proton, Outlook, and iCloud halves take the same set under
 `mod.protonpeek.*`, `mod.outlookpeek.*`, and `mod.icloudpeek.*`, each with
@@ -113,10 +113,13 @@ For the curious; nothing below is required reading.
   tab's title changing is the cue to re-check right away. The feed lists at
   most 20 entries, so more new mail than that reads `20+`. With
   `badge_primary_only` the badge reads the Primary tab's own feed
-  (`feed/atom/^sq_ig_i_personal`) and falls back to the whole inbox if that
-  feed can't be loaded; the popup always lists the whole inbox. The feed
-  can't tell whether an account has inbox tabs turned on, so for an account
-  without them, switch the setting off.
+  (`feed/atom/^sq_ig_i_personal`); the popup always lists the whole inbox.
+  The feeds alone can't tell whether an account has inbox tabs turned on,
+  but Gmail's tab title can: with tabs on its `(N)` is the Primary count,
+  with them off it's the whole inbox's. When the title matches the inbox
+  feed and not the Primary one, that account's badge counts the whole inbox
+  (remembered in `mod.gmailpeek.has_primary`). It also falls back to the
+  inbox if the Primary feed can't be loaded.
 - **Proton** has no Atom feed and its API payload is end-to-end encrypted,
   so the mod keeps a hidden 1×1 `<browser>` per account — always loaded,
   never asleep, sharing the normal cookie jar — pointed at your mailbox view

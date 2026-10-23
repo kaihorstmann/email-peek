@@ -29,7 +29,7 @@
   // renders the whole report into a real browser tab — plain HTML, plain
   // links, no chrome APIs required at click time.
   const EPDiag = (window.__EPDiag ||= (() => {
-    const VERSION = "1.9.2";
+    const VERSION = "1.9.3";
     const CONTACT = {
       email: "malachyfernandez@gmail.com",
       github: "https://github.com/malachyfernandez/email-peek",
@@ -395,6 +395,8 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
   const PRIMARY_PREF = "mod.gmailpeek.badge_primary_only";
   // Gmail's label for the Primary tab.
   const PRIMARY_LABEL = "^sq_ig_i_personal";
+  // JSON { "acct@container": bool } — whether each inbox has a Primary tab.
+  const HAS_PRIMARY_PREF = "mod.gmailpeek.has_primary";
 
   // ContextualIdentityService isn't always a window global in the chrome
   // context — fall back to the module so container lookups are reliable.
@@ -1660,26 +1662,78 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
     // Cache-only repaint (no fetch) for when a start time moves.
     repaintBadges() {
       for (const tab of this.findGmailTabs()) {
-        const key = this.feedKey(
-          this.accountForTab(tab), this.containerForTab(tab), this.badgeLabel());
+        const acct = this.accountForTab(tab), ctx = this.containerForTab(tab);
+        const key = this.feedKey(acct, ctx, this.badgeLabel(this.feedKey(acct, ctx)));
         this.paintBadge(tab, this.caches.get(key)?.data);
       }
     }
 
     // The feed the badge counts from: the Primary tab's when
-    // badge_primary_only is on, so Promotions, Social, Updates and Forums
-    // don't count; otherwise the whole inbox.
-    badgeLabel() {
-      return bPref(PRIMARY_PREF, true) ? PRIMARY_LABEL : "";
+    // badge_primary_only is on and the inbox has one, so Promotions,
+    // Social, Updates and Forums don't count; otherwise the whole inbox.
+    badgeLabel(key) {
+      return bPref(PRIMARY_PREF, true) && this.hasPrimary(key) ? PRIMARY_LABEL : "";
     }
 
     async badgeFeed(acct, containerId, force, tab) {
-      const label = this.badgeLabel();
-      const cache = await this.getFeed(acct, containerId, force, tab, label);
-      if (!label || cache.data) return cache;
+      if (!bPref(PRIMARY_PREF, true)) return this.getFeed(acct, containerId, force, tab);
+      // Both feeds, so whether the inbox has a Primary tab can be settled.
+      const [primary, inbox] = await Promise.all([
+        this.getFeed(acct, containerId, force, tab, PRIMARY_LABEL),
+        this.getFeed(acct, containerId, force, tab),
+      ]);
+      const key = this.feedKey(acct, containerId);
+      this.detectPrimary(key, primary.data, inbox.data);
+      if (!this.hasPrimary(key)) return inbox;
+      if (primary.data) return primary;
       // No Primary feed for this account — count the whole inbox instead.
-      EPDiag.log("badge", "Primary feed unavailable, using inbox", { acct, ctx: containerId, err: cache.error });
-      return this.getFeed(acct, containerId, force, tab);
+      EPDiag.log("badge", "Primary feed unavailable, using inbox", { acct, ctx: containerId, err: primary.error });
+      return inbox;
+    }
+
+    // An inbox has a Primary tab until its title shows otherwise.
+    hasPrimary(key) {
+      return this.primaryTabs()[key] !== false;
+    }
+
+    primaryTabs() {
+      try {
+        const has = JSON.parse(sPref(HAS_PRIMARY_PREF, "{}"));
+        return has && typeof has === "object" ? has : {};
+      } catch {
+        return {};
+      }
+    }
+
+    // Gmail's title carries the inbox's unread count — "Inbox (3,466) - …"
+    // ("3.466", "3 466" in other locales). Null when it shows none.
+    titleCount(tab) {
+      const label = tab.getAttribute?.("label") || tab.label || "";
+      const m = label.match(/\((\d[\d.,\s ]*)\)/);
+      return m ? parseInt(m[1].replace(/\D/g, ""), 10) : null;
+    }
+
+    // With inbox tabs on, Gmail's title count is the Primary tab's alone;
+    // with them off it's the whole inbox's. So the title matching one feed
+    // and not the other settles whether this inbox has a Primary tab.
+    // When the feeds agree, or the title matches neither (one is a beat
+    // behind), the last answer stands.
+    detectPrimary(key, primary, inbox) {
+      if (!primary || !inbox || primary.count === inbox.count) return;
+      const n = this.findGmailTabs()
+        .filter(t => this.cacheKeyForTab(t) === key)
+        .map(t => this.titleCount(t))
+        .find(c => c !== null);
+      const has = n === primary.count ? true : n === inbox.count ? false : null;
+      if (has === null || this.primaryTabs()[key] === has) return;
+      const all = this.primaryTabs();
+      all[key] = has;
+      EPDiag.log("badge", has ? "Primary tab detected" : "no Primary tab, counting whole inbox", {
+        key, title: n, primary: primary.count, inbox: inbox.count,
+      });
+      try {
+        Services.prefs.setStringPref(HAS_PRIMARY_PREF, JSON.stringify(all));
+      } catch {}
     }
 
     // Reading mail changes the Gmail tab's title ("Inbox (3)" → "(2)"), so
