@@ -141,7 +141,9 @@ For the curious; nothing below is required reading.
 - **Outlook** uses the same phantom-browser + actor architecture, tuned to
   OWA's rendered DOM: rows are `[data-convid][role=option]` in the
   `#MailList` listbox, unread rows announce themselves with an `Unread`
-  prefix in their `aria-label`, sender lives in `span[title="<email>"]`, and
+  status word at the start of their `aria-label` (a labelled row without
+  one is read — including mail Microsoft 365 tags `Promotions`, whose
+  `Unread` can sit behind the tag), sender lives in `span[title="<email>"]`, and
   the timestamp hides in a `title` attribute. Clicking a row opens the
   canonical `/mail/N/<folder>/id/<convid>` route; `+` hunts the
   `New mail` button and falls back to `/mail/deeplink/compose`.

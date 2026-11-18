@@ -476,6 +476,8 @@ test("Outlook collect extracts sender, subject, displayed date and unread state"
     time: "4:41 AM",
     fullDate: "Wed 9/30/2026 4:41 AM",
     unread: true,
+    unreadWhy: "aria-prefix",
+    promo: false,
     index: 0,
   });
 });
@@ -488,10 +490,43 @@ test("Outlook unread state follows aria prefix and mark-as affordances", () => {
     child.isUnread(owaRow({ ariaLabel: "Collapsed Sender Two subject 9:00 AM", markAs: "Mark as unread" })),
     false
   );
-  // Unknown stays undetermined rather than hidden.
-  const bare = owaRow({ ariaLabel: "no signal here" });
+  // A labelled row without "Unread" is read; only a row with no label at
+  // all stays undetermined rather than hidden.
+  const labelled = owaRow({ ariaLabel: "Collapsed Sender Two subject 9:00 AM" });
+  labelled.querySelector = () => null;
+  assert.equal(child.isUnread(labelled), false);
+  const bare = owaRow({ ariaLabel: "" });
   bare.querySelector = () => null;
   assert.equal(child.isUnread(bare), null);
+});
+
+test("Outlook Promotions-tagged mail counts while unread and comes off once read", () => {
+  const child = outlookScraper(null);
+  // Tagged rows can lack the Mark as read/unread hover buttons.
+  const row = ariaLabel => {
+    const r = owaRow({ ariaLabel });
+    r.querySelector = () => null;
+    return r;
+  };
+  assert.deepEqual([...child.unreadState(row("Promotions Unread Collapsed Shop Co 40% off 9:00 AM"))], [true, "aria-status"],
+    "unread behind the tag still counts");
+  assert.deepEqual([...child.unreadState(row("Unread Promotions Shop Co 40% off 9:00 AM"))], [true, "aria-prefix"]);
+  assert.deepEqual([...child.unreadState(row("Promotions Collapsed Shop Co 40% off 9:00 AM"))], [false, "aria-no-unread"],
+    "read and tagged: off the badge");
+  assert.deepEqual(
+    [...child.unreadState(row("Promotions Shop Co Your cart misses you 9:00 AM You have 3 unread messages waiting"))],
+    [false, "aria-no-unread"],
+    "\"unread\" in the preview text doesn't make a read promo unread");
+
+  // The tag pill is found as its own element, not in a subject.
+  const pill = (attrs, text, kids = 0) => ({
+    getAttribute: n => attrs[n] ?? null, textContent: text, childElementCount: kids,
+  });
+  const tagged = nodes => ({ querySelectorAll: () => nodes });
+  assert.equal(child.isPromotion(tagged([pill({}, "Promotions")])), true);
+  assert.equal(child.isPromotion(tagged([pill({ title: "Promotions" }, "")])), true);
+  assert.equal(child.isPromotion(tagged([pill({}, "Big promotions this week")])), false);
+  assert.equal(child.isPromotion(tagged([pill({}, "Promotions", 2)])), false, "a container is not the pill");
 });
 
 test("Outlook peek URL uses the pinned home view, not the wandering tab", () => {

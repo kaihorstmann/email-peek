@@ -57,7 +57,7 @@
   // renders the whole report into a real browser tab — plain HTML, plain
   // links, no chrome APIs required at click time.
   const EPDiag = (window.__EPDiag ||= (() => {
-    const VERSION = "1.9.4";
+    const VERSION = "1.9.5";
     const CONTACT = {
       email: "malachyfernandez@gmail.com",
       github: "https://github.com/malachyfernandez/email-peek",
@@ -419,6 +419,11 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
   const CHILD_SOURCE = String.raw`
 const _PPBase =
   typeof JSWindowActorChild !== "undefined" ? JSWindowActorChild : class {};
+// OWA opens each row's aria-label with status words before the sender —
+// "Unread Collapsed Pinned <sender> …" — and Microsoft 365 adds
+// "Promotions" for mail it tags as promotional.
+const OWA_STATUS =
+  /^(Unread|Collapsed|Expanded|Pinned|Flagged|Selected|Draft|Item|Has attachments?|Promotions?)\s+/i;
 export class OutlookPeekChild extends _PPBase {
   receiveMessage(message) {
     try {
@@ -532,6 +537,8 @@ export class OutlookPeekChild extends _PPBase {
       time: time.text,
       fullDate: time.full,
       unread: this.isUnread(row),
+      unreadWhy: this.unreadState(row)[1],
+      promo: this.isPromotion(row),
     };
   }
 
@@ -596,9 +603,7 @@ export class OutlookPeekChild extends _PPBase {
       .trim();
     label = label.replace(/\s*No conversations? selected.*$/i, "");
     let m;
-    const flags =
-      /^(Unread|Collapsed|Expanded|Pinned|Flagged|Selected|Draft|Item|Has attachments?)\s+/i;
-    while ((m = label.match(flags))) label = label.slice(m[0].length);
+    while ((m = label.match(OWA_STATUS))) label = label.slice(m[0].length);
     if (sender) {
       const i = label.indexOf(sender);
       if (i !== -1) label = label.slice(i + sender.length).trim();
@@ -658,13 +663,31 @@ export class OutlookPeekChild extends _PPBase {
   }
 
   isUnread(row) {
+    return this.unreadState(row)[0];
+  }
+
+  // The status words a row's aria-label opens with, lowercased.
+  statusWords(aria) {
+    const words = [];
+    let label = aria.replace(/\s+/g, " ").trim() + " ";
+    let m;
+    while ((m = label.match(OWA_STATUS))) {
+      words.push(m[1].toLowerCase());
+      label = label.slice(m[0].length);
+    }
+    return words;
+  }
+
+  // [unread, which signal decided it] — the signal is logged (never the
+  // row's text) so a row that keeps the badge up can be explained.
+  unreadState(row) {
     const aria = (row.getAttribute("aria-label") || "").trim();
     // OWA prefixes unread rows' accessible name with "Unread".
-    if (/^unread\b/i.test(aria)) return true;
+    if (/^unread\b/i.test(aria)) return [true, "aria-prefix"];
     const cls = row.classList;
-    if (cls && cls.contains("read")) return false;
-    if (cls && cls.contains("unread")) return true;
-    if (row.querySelector(".item-unread-dot")) return true;
+    if (cls && cls.contains("read")) return [false, "class"];
+    if (cls && cls.contains("unread")) return [true, "class"];
+    if (row.querySelector(".item-unread-dot")) return [true, "dot"];
     // Hover affordances: an unread row offers "Mark as read", a read row
     // offers "Mark as unread".
     if (
@@ -672,15 +695,39 @@ export class OutlookPeekChild extends _PPBase {
         '[title="Mark as unread" i], [aria-label*="Mark as unread" i]'
       )
     )
-      return false;
+      return [false, "offers-mark-unread"];
     if (
       row.querySelector(
         '[title="Mark as read" i], [aria-label*="Mark as read" i]'
       )
     )
-      return true;
-    if (/\bunread\b/i.test(aria)) return true;
-    return null;
+      return [true, "offers-mark-read"];
+    if (aria) {
+      // "Unread" among the leading status words (e.g. after a "Promotions"
+      // tag) — never anywhere in the label, which carries the preview text:
+      // a promo saying "you have unread messages" stayed unread forever.
+      if (this.statusWords(aria).includes("unread")) return [true, "aria-status"];
+      // OWA names every unread row "Unread …", so a labelled row without
+      // it is read. Tagged rows can lack the hover affordances above, and
+      // leaving them undetermined kept them on the badge after reading.
+      return [false, "aria-no-unread"];
+    }
+    return [null, "none"];
+  }
+
+  // Microsoft 365 tags promotional mail "Promotions" (MC1279093): it stays
+  // in the inbox with a Promotions pill on the row. Only logged — tagged
+  // rows count like any other — so a row stuck on the badge can be traced.
+  // The pill is matched as a whole element (a label, tooltip or bare text
+  // that is exactly the word), not a subject that mentions promotions.
+  isPromotion(row) {
+    for (const n of row.querySelectorAll("[aria-label], [title], span, div")) {
+      for (const v of [n.getAttribute("aria-label"), n.getAttribute("title")]) {
+        if (v && /^\s*promotions?\s*$/i.test(v)) return true;
+      }
+      if (!n.childElementCount && /^\s*promotions?\s*$/i.test(n.textContent || "")) return true;
+    }
+    return false;
   }
 
   cssEscape(s) {
@@ -1614,7 +1661,13 @@ export class OutlookPeekChild extends _PPBase {
           tab,
           this.scrapeTab(tab)
             .then(data => {
-              EPDiag.log("peek", "scraped", { entries: data?.entries?.length, count: data?.count, title: String(data?.title || "").slice(0, 60) });
+              EPDiag.log("peek", "scraped", {
+                entries: data?.entries?.length,
+                count: data?.count,
+                title: String(data?.title || "").slice(0, 60),
+                // Why each listed row counts as unread — no subjects.
+                why: data?.entries?.map(e => (e.promo ? "promo:" : "") + e.unreadWhy),
+              });
               const t = Date.now();
               this.caches.set(tab, { t, refreshedAt: t, data, error: null });
             })
