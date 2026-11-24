@@ -24,9 +24,9 @@ const { CHILD_SOURCE, PARENT_SOURCE, ProtonPeek } = context.subject;
 const gmailContext = { window: {}, console: testConsole, setTimeout, clearTimeout, setInterval: context.setInterval, clearInterval, Services: context.Services };
 vm.runInNewContext(readFileSync(new URL("./gmail-peek.uc.js", import.meta.url), "utf8").replace(
   "  const boot = () => {",
-  "  globalThis.GmailPeek = GmailPeek; return;\n  const boot = () => {"
+  "  globalThis.GmailPeek = GmailPeek; globalThis.GmailChildSource = CHILD_SOURCE; globalThis.gmailEnsureActor = ensureActor; return;\n  const boot = () => {"
 ), gmailContext);
-const { GmailPeek } = gmailContext;
+const { GmailPeek, GmailChildSource } = gmailContext;
 const outlookSource = readFileSync(new URL("./outlook-peek.uc.js", import.meta.url), "utf8");
 const outlookContext = { window: {}, console: testConsole, setTimeout, clearTimeout, setInterval: context.setInterval, clearInterval, Services: context.Services, URL, URLSearchParams };
 vm.runInNewContext(outlookSource.replace(
@@ -1232,6 +1232,134 @@ test("Gmail takes just-read mail off the badge before the feed catches up", () =
   tabs = [tab(0, "Inbox (3,466) - me@gmail.com - Gmail")];
   assert.equal(peek.badgeCount("0@0", primary).count, 3466, "all mode shows Gmail's own live count");
 }));
+
+// A Gmail inbox-list row: tr.zA, .zE unread / .yO read.
+function gmailRow({ unread = true, sender = "Ada Lovelace", subject = "Notes", snippet = " - see attached",
+                    time = "9:19 AM", full = "Mon, Nov 24, 2026, 9:19 AM", thread = "19a1b2c3d4e5f6a7", visible = true } = {}) {
+  const node = (text, attrs = {}) => ({ textContent: text, getAttribute: n => attrs[n] ?? null });
+  const parts = {
+    ".bog": node(subject), ".y2": node(snippet), ".xW span[title]": node(time, { title: full }),
+    "[data-legacy-thread-id]": node("", { "data-legacy-thread-id": thread }), ".bqe": unread ? node(subject) : null,
+    ".yW": node(sender),
+  };
+  const cls = new Set(["zA", unread ? "zE" : "yO"]);
+  return {
+    classList: { contains: c => cls.has(c) },
+    checkVisibility: () => visible,
+    querySelector: sel => parts[sel] ?? null,
+    querySelectorAll: sel => (sel === ".yW [email]" ? [node(sender, { email: "ada@example.com", name: sender })] : []),
+  };
+}
+const gmailInboxDoc = (rows, hash = "#inbox") => ({
+  body: {}, location: { hash }, querySelectorAll: sel => (sel === "tr.zA" ? rows : []),
+});
+function gmailReader(doc) {
+  const scope = {};
+  vm.runInNewContext(GmailChildSource.replace("export class GmailPeekChild", "globalThis.GmailPeekChild = class GmailPeekChild"), scope);
+  const child = new scope.GmailPeekChild();
+  child.document = doc;
+  return child;
+}
+
+test("Gmail registers its page reader for mail.google.com from modules it wrote", async () => {
+  const files = new Map();
+  let name, options;
+  Object.assign(gmailContext, {
+    PathUtils: { profileDir: "/fixture", join: (...parts) => parts.join("/") },
+    IOUtils: { makeDirectory: async () => {}, writeUTF8: async (path, content) => files.set(path.split("/").pop(), content) },
+    fetch: async () => ({ ok: true }),
+    ChromeUtils: {
+      importESModule: uri => {
+        const code = files.get(uri.split("/").pop());
+        assert.ok(code, "preflight loads a file ensureActor wrote");
+        const scope = { JSWindowActorParent: class {}, JSWindowActorChild: class {} };
+        vm.runInNewContext(code.replace(/export class (\w+)/, "globalThis.$1 = class $1"), scope);
+        return scope;
+      },
+      registerWindowActor: (n, o) => { name = n; options = o; },
+    },
+  });
+  await gmailContext.gmailEnsureActor();
+  assert.equal(name, "GmailPeek");
+  assert.deepEqual(Array.from(options.matches), ["https://mail.google.com/*"]);
+  assert.equal(options.safeForUntrustedWebProcess, true);
+  assert.equal(options.allFrames, false);
+  assert.equal(options.child.matches, undefined, "options sit at the top level, not under child");
+  assert.ok(options.remoteTypes.every(type => !type.includes("=")));
+});
+
+test("Gmail page reader lists the visible inbox rows, read and unread", () => {
+  const hidden = gmailRow({ subject: "From a view visited earlier", visible: false });
+  const res = gmailReader(gmailInboxDoc([gmailRow(), hidden, gmailRow({ unread: false, sender: "Bob", subject: "Old" })])).collect(6);
+  assert.equal(res.error, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(res.rows)), [
+    { title: "Notes", author: "Ada Lovelace", summary: "see attached", time: "9:19 AM",
+      fullDate: "Mon, Nov 24, 2026, 9:19 AM", unread: true, threadId: "19a1b2c3d4e5f6a7" },
+    { title: "Old", author: "Bob", summary: "see attached", time: "9:19 AM",
+      fullDate: "Mon, Nov 24, 2026, 9:19 AM", unread: false, threadId: "19a1b2c3d4e5f6a7" },
+  ]);
+  assert.equal(gmailReader(gmailInboxDoc([gmailRow(), gmailRow(), gmailRow()])).collect(2).rows.length, 2, "last N only");
+});
+
+test("Gmail page reader only reads the inbox list itself", () => {
+  const rows = [gmailRow()];
+  for (const hash of ["", "#inbox", "#inbox?compose=new", "#category/social"]) {
+    assert.equal(gmailReader(gmailInboxDoc(rows, hash)).collect(6).rows.length, 1, `list view ${hash || "(none)"}`);
+  }
+  for (const hash of ["#inbox/FMfcgzQXJ", "#sent", "#label/Work", "#search/from%3Aada"]) {
+    assert.equal(gmailReader(gmailInboxDoc(rows, hash)).collect(6).error, "not-inbox-list", hash);
+  }
+  assert.equal(gmailReader(gmailInboxDoc([gmailRow({ visible: false })])).collect(6).error, "no-visible-rows");
+});
+
+test("Gmail popup reads an awake tab of the same account, else falls back", async () => {
+  const peek = new GmailPeek();
+  const asked = [];
+  // Asleep, a tab's page is about:blank; Zen keeps its home URL here.
+  const tab = (acct, { asleep = false, rows = [{ title: "x" }] } = {}) => ({
+    _zenPinnedInitialState: { entry: { url: `https://mail.google.com/mail/u/${acct}/` } },
+    hasAttribute: n => n === "pending" && asleep,
+    linkedBrowser: {
+      currentURI: { spec: asleep ? "about:blank" : `https://mail.google.com/mail/u/${acct}/#inbox` },
+      browsingContext: { currentWindowGlobal: { getActor: () => ({ sendQuery: async (n, d) => (asked.push([String(acct), d.max]), { rows }) }) } },
+    },
+  });
+  const sleeping = tab(1, { asleep: true });
+  const awake = tab(1);
+  const other = tab(0);
+  peek.findGmailTabs = () => [sleeping, awake, other];
+  assert.deepEqual(JSON.parse(JSON.stringify(await peek.readInbox(sleeping, 6))), [{ title: "x" }],
+    "hovered tab asleep: another awake tab of that account is read");
+  assert.deepEqual(asked, [["1", 6]]);
+  peek.findGmailTabs = () => [sleeping, other];
+  assert.equal(await peek.readInbox(sleeping, 6), null, "no awake tab of that account: feed");
+  assert.equal(await peek.readInbox(tab(1, { rows: [] }), 6), null, "an empty read falls back too");
+});
+
+test("Gmail popup marks unread rows and links each to its thread", () => {
+  const peek = new GmailPeek();
+  peek.box = uiNode();
+  peek.panel = { state: "open" };
+  const tab = { linkedBrowser: { currentURI: { spec: "https://mail.google.com/mail/u/1/#inbox" } }, hasAttribute: () => false };
+  const feed = { data: { count: 593, entries: [{ title: "Feed", author: "F", issued: "", link: "https://feed/link" }] }, error: null };
+  peek.inboxes.set("1@0", [
+    { title: "New", author: "Ada", unread: true, threadId: "abc", fullDate: "", time: "9:19 AM" },
+    { title: "Seen", author: "Bob", unread: false, threadId: null, fullDate: "", time: "Nov 20" },
+  ]);
+  peek.render(feed, "1", tab);
+  const rows = peek.box.children.filter(c => c.className.split(" ").includes("gp-row"));
+  assert.deepEqual(rows.map(r => r.className), ["gp-row", "gp-row gp-read"]);
+  assert.deepEqual(rows.map(r => !!r.querySelector(".gp-unread-dot")), [true, false]);
+  assert.deepEqual(rows.map(r => r.attributes["data-link"]), [
+    "https://mail.google.com/mail/u/1/#inbox/abc", "https://mail.google.com/mail/u/1/#inbox"]);
+  assert.equal(rows[1].querySelector(".gp-time").textContent, "Nov 20", "Gmail's own time when the date won't parse");
+
+  peek.inboxes.clear();
+  peek.render(feed, "1", tab);
+  const fallback = peek.box.children.filter(c => c.className.split(" ").includes("gp-row"));
+  assert.equal(fallback.length, 1, "no page rows: the feed's unread list");
+  assert.ok(fallback[0].querySelector(".gp-unread-dot"), "feed rows are all unread");
+});
 
 test("every provider script carries the shared diagnostics core", () => {
   for (const f of ["gmail-peek.uc.js", "proton-peek.uc.js", "outlook-peek.uc.js", "icloud-peek.uc.js"]) {

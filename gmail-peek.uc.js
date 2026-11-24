@@ -29,7 +29,7 @@
   // renders the whole report into a real browser tab — plain HTML, plain
   // links, no chrome APIs required at click time.
   const EPDiag = (window.__EPDiag ||= (() => {
-    const VERSION = "1.9.5";
+    const VERSION = "1.9.6";
     const CONTACT = {
       email: "malachyfernandez@gmail.com",
       github: "https://github.com/malachyfernandez/email-peek",
@@ -398,6 +398,175 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
   // JSON { "acct@container": bool } — whether each inbox has a Primary tab.
   const HAS_PRIMARY_PREF = "mod.gmailpeek.has_primary";
 
+  // ---------- inbox list actor ----------
+  // The feed only carries unread mail. To list the inbox as Gmail shows it —
+  // read and unread — the popup asks an awake Gmail tab's page for its
+  // rows. Pages live in content processes, so a JSWindowActor reads them;
+  // its modules are written to disk and registered like the other peeks'.
+  const ACTOR = "GmailPeek";
+
+  const PARENT_SOURCE = String.raw`export class GmailPeekParent extends JSWindowActorParent {}`;
+
+  const CHILD_SOURCE = String.raw`
+const _GPBase =
+  typeof JSWindowActorChild !== "undefined" ? JSWindowActorChild : class {};
+export class GmailPeekChild extends _GPBase {
+  receiveMessage(message) {
+    try {
+      const data = message.data || {};
+      if (message.name === "GmailPeek:Ping") return { ok: true };
+      if (message.name === "GmailPeek:Collect") return this.collect(data.max || 6);
+      return { error: "unknown-message" };
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  }
+
+  doc() {
+    if (this.document) return this.document;
+    try { return this.contentWindow && this.contentWindow.document; } catch (e) { return null; }
+  }
+
+  // Rows of the inbox list on screen. Only the list itself counts: an
+  // open conversation (#inbox/<id>) or another label isn't the inbox.
+  collect(max) {
+    const doc = this.doc();
+    const res = { rows: [], error: null };
+    if (!doc || !doc.body) {
+      res.error = "empty-document";
+      return res;
+    }
+    const hash = (doc.location && doc.location.hash) || "";
+    if (!/^(#inbox(\?.*)?|#category\/[^/?]+(\?.*)?)?$/i.test(hash)) {
+      res.error = "not-inbox-list";
+      return res;
+    }
+    // Gmail keeps lists of views visited earlier in the DOM, hidden.
+    const all = Array.from(doc.querySelectorAll("tr.zA"));
+    const rows = all.filter(r => this.visible(r));
+    if (!rows.length) {
+      res.error = all.length ? "no-visible-rows" : "no-rows";
+      return res;
+    }
+    res.rows = rows.slice(0, max).map(r => this.extractRow(r));
+    return res;
+  }
+
+  visible(row) {
+    try {
+      return typeof row.checkVisibility === "function"
+        ? row.checkVisibility()
+        : row.getClientRects().length > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  text(n) {
+    return n ? (n.textContent || "").replace(/\s+/g, " ").trim() : "";
+  }
+
+  // Gmail's list markup: tr.zA rows, tr.zE unread / tr.yO read, senders as
+  // [email] spans in .yW, subject .bog (bold .bqe while unread), snippet
+  // .y2, time in .xW span[title], thread id on [data-legacy-thread-id].
+  extractRow(row) {
+    const names = [];
+    for (const s of row.querySelectorAll(".yW [email]")) {
+      const name = (s.getAttribute("name") || this.text(s)).trim();
+      if (name && !names.includes(name)) names.push(name);
+    }
+    const time = row.querySelector(".xW span[title]");
+    const idEl = row.querySelector("[data-legacy-thread-id]");
+    const cls = row.classList;
+    return {
+      title: this.text(row.querySelector(".bog")) || "(no subject)",
+      author: names.join(", ") || this.text(row.querySelector(".yW")) || "?",
+      summary: this.text(row.querySelector(".y2")).replace(/^[-–—]\s*/, ""),
+      time: this.text(time),
+      fullDate: (time && time.getAttribute("title")) || "",
+      unread: cls.contains("zE") ? true
+        : cls.contains("yO") ? false
+        : row.querySelector(".bqe") ? true
+        : null,
+      threadId: (idEl && idEl.getAttribute("data-legacy-thread-id")) || null,
+    };
+  }
+}
+`;
+
+  // fx-autoconfig maps chrome://userscripts/ to chrome/JS/ and Sine maps
+  // chrome://userchromejs/ to chrome/: write to both and probe which URI
+  // resolves, falling back to data: URIs.
+  const actorDirs = () => [
+    PathUtils.join(PathUtils.profileDir, "chrome", "JS", "gmail-peek-actor"),
+    PathUtils.join(PathUtils.profileDir, "chrome", "gmail-peek-actor"),
+  ];
+  const ACTOR_BASES = [
+    "chrome://userscripts/content/gmail-peek-actor/",
+    "chrome://userchromejs/content/gmail-peek-actor/",
+  ];
+  const PARENT_FILE = "GmailPeekParent-20261124-release.sys.mjs";
+  const CHILD_FILE = "GmailPeekChild-20261124-release.sys.mjs";
+  let childModuleURI = null;
+  let actorReady = null;
+
+  const probe = async uri => {
+    try {
+      const res = await fetch(uri, { credentials: "omit", cache: "no-store" });
+      if (res.ok) {
+        res.body?.cancel?.();
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+
+  const ensureActor = async () => {
+    for (const dir of actorDirs()) {
+      try {
+        await IOUtils.makeDirectory(dir, { createAncestors: true, ignoreExisting: true });
+        await IOUtils.writeUTF8(PathUtils.join(dir, PARENT_FILE), PARENT_SOURCE);
+        await IOUtils.writeUTF8(PathUtils.join(dir, CHILD_FILE), CHILD_SOURCE);
+      } catch {}
+    }
+    let base = null;
+    for (const b of ACTOR_BASES) {
+      if (await probe(b + CHILD_FILE)) {
+        base = b;
+        break;
+      }
+    }
+    const dataUri = src => "data:text/javascript;charset=utf-8," + encodeURIComponent(src);
+    childModuleURI = base ? base + CHILD_FILE : dataUri(CHILD_SOURCE);
+    // matches/remoteTypes/allFrames/safeForUntrustedWebProcess are
+    // top-level WindowActorOptions — nested under child they are dropped.
+    const options = {
+      parent: { esModuleURI: base ? base + PARENT_FILE : dataUri(PARENT_SOURCE) },
+      child: { esModuleURI: childModuleURI },
+      matches: ["https://mail.google.com/*"],
+      remoteTypes: ["web", "webIsolated", "webCOOP+COEP", "webServiceWorker", "file", "parent"],
+      allFrames: false,
+      includeChrome: false,
+      safeForUntrustedWebProcess: true,
+    };
+    try {
+      const parentModule = ChromeUtils.importESModule(options.parent.esModuleURI);
+      const childModule = ChromeUtils.importESModule(options.child.esModuleURI);
+      if (typeof parentModule.GmailPeekParent !== "function" ||
+          typeof childModule.GmailPeekChild?.prototype.collect !== "function") {
+        throw new Error("missing actor exports");
+      }
+    } catch (err) {
+      throw new Error(`actor-module-invalid: ${err?.message || err}`);
+    }
+    try {
+      ChromeUtils.registerWindowActor(ACTOR, options);
+    } catch (err) {
+      // A second window re-runs this file; the actor is already there.
+      if (!/already.*(registered|exists)/i.test(String(err?.message || err))) throw err;
+    }
+  };
+
   // ContextualIdentityService isn't always a window global in the chrome
   // context — fall back to the module so container lookups are reliable.
   const cis = () => {
@@ -542,6 +711,23 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
     #gmailpeek-panel .gp-row:focus-visible {
       background: var(--gp-hover);
     }
+    /* Unread marker, in the row's left padding so read and unread rows
+       line up. */
+    #gmailpeek-panel .gp-row {
+      position: relative;
+    }
+    #gmailpeek-panel .gp-unread-dot {
+      position: absolute;
+      left: 5px;
+      top: 14px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: AccentColor;
+    }
+    #gmailpeek-panel .gp-read .gp-author {
+      font-weight: 400;
+    }
     #gmailpeek-panel .gp-topline {
       display: flex;
       align-items: baseline;
@@ -636,6 +822,7 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       this.box = null;
       this.caches = new Map(); // account -> { t, data, error }
       this.inflights = new Map(); // account -> Promise
+      this.inboxes = new Map(); // acct@container -> rows read from Gmail's page
       this.gmailTabs = new Set();
       this.boundTabs = new WeakSet();
       this.refreshSequence = 0;
@@ -657,6 +844,10 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
 
     init() {
       EPDiag.boot("gmail-peek");
+      // Without the actor the popup simply keeps listing the feed.
+      actorReady = ensureActor().catch(err => {
+        EPDiag.log("boot", "gmail inbox actor unavailable", String(err?.message || err));
+      });
       const style = el("style");
       style.textContent = CSS;
       (document.head || document.documentElement).appendChild(style);
@@ -1402,10 +1593,12 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       box.replaceChildren();
       this.setRefreshing(this.refreshing);
       const containerId = tab ? this.containerForTab(tab) : 0;
+      const pageRows = tab ? this.inboxes.get(this.cacheKeyForTab(tab)) : null;
       EPDiag.log("render", "paint", {
         acct,
         ctx: containerId,
-        entries: cache?.data?.entries?.length,
+        source: pageRows ? "page" : "feed",
+        entries: pageRows ? pageRows.length : cache?.data?.entries?.length,
         count: cache?.data?.count,
         error: cache?.error,
       });
@@ -1446,6 +1639,22 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       header.appendChild(right);
       box.appendChild(header);
 
+      // The inbox as Gmail's page lists it: read and unread, newest first.
+      if (pageRows?.length) {
+        for (const r of pageRows.slice(0, max)) {
+          this.appendRow({
+            link: r.threadId ? `${inboxUrl(acct)}/${r.threadId}` : inboxUrl(acct),
+            author: r.author,
+            when: timeAgo(r.fullDate) || r.time,
+            title: r.title,
+            summary: r.summary,
+            unread: r.unread,
+          });
+        }
+        box.appendChild(this.composeButton());
+        return;
+      }
+
       if (cache.error) {
         const msg =
           cache.error === "signed-out"
@@ -1462,21 +1671,39 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       if (!entries.length) {
         box.appendChild(el("div", "gp-status", "No unread mail"));
       } else {
+        // The feed only carries unread mail.
         for (const entry of entries.slice(0, max)) {
-          const row = el("div", "gp-row");
-          row.setAttribute("data-link", entry.link);
-          const top = el("div", "gp-topline");
-          top.appendChild(el("span", "gp-author", entry.author));
-          top.appendChild(el("span", "gp-time", timeAgo(entry.issued)));
-          row.appendChild(top);
-          row.appendChild(el("div", "gp-subject", entry.title));
-          if (entry.summary) {
-            row.appendChild(el("div", "gp-snippet", entry.summary));
-          }
-          box.appendChild(row);
+          this.appendRow({
+            link: entry.link,
+            author: entry.author,
+            when: timeAgo(entry.issued),
+            title: entry.title,
+            summary: entry.summary,
+            unread: true,
+          });
         }
       }
       box.appendChild(this.composeButton());
+    }
+
+    // An unread row gets a dot; a read one loses the bold.
+    appendRow({ link, author, when, title, summary, unread }) {
+      const row = el("div", unread === false ? "gp-row gp-read" : "gp-row");
+      row.setAttribute("data-link", link);
+      if (unread) {
+        const dot = el("span", "gp-unread-dot");
+        dot.setAttribute("aria-label", "Unread");
+        row.appendChild(dot);
+      }
+      const top = el("div", "gp-topline");
+      top.appendChild(el("span", "gp-author", author));
+      top.appendChild(el("span", "gp-time", when));
+      row.appendChild(top);
+      row.appendChild(el("div", "gp-subject", title));
+      if (summary) {
+        row.appendChild(el("div", "gp-snippet", summary));
+      }
+      this.box.appendChild(row);
     }
 
     composeButton() {
@@ -1514,7 +1741,16 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
       const containerId = this.containerForTab(tab);
       this.setRefreshing(true);
       try {
-        const cache = await this.getFeed(acct, containerId, true, tab);
+        const key = this.cacheKeyForTab(tab);
+        const [cache, rows] = await Promise.all([
+          this.getFeed(acct, containerId, true, tab),
+          this.readInbox(tab, iPref("mod.gmailpeek.max_items", 6)),
+        ]);
+        // Rows from a tab that has since gone to sleep would show stale
+        // read states, so a miss falls back to the feed rather than keeping
+        // the last list.
+        if (rows) this.inboxes.set(key, rows);
+        else this.inboxes.delete(key);
         if (sequence !== this.refreshSequence || this.currentTab !== tab || this.panel.state === "closed") return;
         // The badge may read a different feed (Primary only) than the
         // popup — with the whole inbox it hits the cache just filled.
@@ -1529,6 +1765,47 @@ document.getElementById("email").addEventListener("click", () => copyReport(true
 
     doRefresh() {
       return this.refresh(this.currentTab);
+    }
+
+    // The inbox as Gmail's own page lists it, read and unread, from an
+    // awake tab of this account that is showing the inbox list — the
+    // hovered tab first. Null when there's none; the popup then lists the
+    // feed's unread mail.
+    async readInbox(tab, max) {
+      await actorReady;
+      const key = this.cacheKeyForTab(tab);
+      const tabs = [tab, ...this.findGmailTabs().filter(t => t !== tab && this.cacheKeyForTab(t) === key)];
+      for (const t of tabs) {
+        const browser = t.linkedBrowser;
+        if (t.hasAttribute?.("pending") || !/^https:\/\/mail\.google\.com\//.test(browser?.currentURI?.spec || "")) continue;
+        let actor;
+        try {
+          actor = browser.browsingContext?.currentWindowGlobal?.getActor(ACTOR);
+        } catch {}
+        if (!actor) continue;
+        try {
+          const res = await this.queryActor(actor, "GmailPeek:Collect", { max });
+          EPDiag.log("inbox", "read", { key, rows: res?.rows?.length, err: res?.error });
+          if (res?.rows?.length) return res.rows;
+        } catch (err) {
+          EPDiag.log("inbox", "read failed", { key, err: String(err?.message || err) });
+        }
+      }
+      return null;
+    }
+
+    async queryActor(actor, name, data = {}, timeout = 2000) {
+      let timer;
+      try {
+        return await Promise.race([
+          actor.sendQuery(name, data),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`actor-query-timeout: ${name}`)), timeout);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     // ---------- interactions ----------

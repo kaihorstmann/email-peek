@@ -13,7 +13,9 @@ through the session you're already signed in with.
 
 ## What you get
 
-- **Unread mail only.** If the list is empty, congratulations — you're done.
+- **Unread mail only** — except on Gmail with its tab open, where you get
+  your latest emails with a dot on the unread ones. If the list is empty,
+  congratulations — you're done.
 - **Unread-count badge** right on the tab icon. On Gmail it counts, by
   default, only mail that arrived after Email Peek started watching that
   inbox, and each one stays on the badge until you read it — the old unread
@@ -41,8 +43,10 @@ through the session you're already signed in with.
 
 ## Gmail Peek
 
-The Gmail half, pictured up top. Hover your pinned Gmail tab and your unread
-mail appears — sender, subject, a snippet, and how long ago it arrived.
+The Gmail half, pictured up top. Hover your pinned Gmail tab and your mail
+appears — sender, subject, a snippet, and how long ago it arrived. While the
+tab is awake on your inbox you see your latest emails, unread ones marked
+with a dot; when it's asleep or elsewhere, your unread mail.
 Works with Gmail signed in across the default context or inside
 **Firefox/Zen Multi-Account Containers** (Work, Personal, etc.).
 
@@ -104,8 +108,13 @@ For the curious; nothing below is required reading.
 - **Gmail** fetches `https://mail.google.com/mail/u/N/feed/atom` from the
   browser's chrome context, riding your existing session cookies — including
   the tab's own cookie jar, so container and private-window sessions work.
-  The feed only ever contains unread mail, which is exactly what the popup
-  shows. The two "new" badge modes count feed entries issued after a
+  The feed only ever contains unread mail, so to list read mail too the
+  popup asks an awake Gmail tab of that account, sitting on its inbox list,
+  for the rows it shows (a `GmailPeek` JSWindowActor reads `tr.zA` rows:
+  `.zE` unread, `.yO` read). An open conversation, another label or a
+  sleeping tab means no rows, and the popup lists the feed's unread mail
+  instead. The badge always counts from the feed. The two "new" badge
+  modes count feed entries issued after a
   per-inbox start time (`mod.gmailpeek.new_since`), set the first time the
   inbox is seen and reset whenever the mode changes. `since_visit` also
   moves it whenever you select or leave the tab; `until_read` never does.
